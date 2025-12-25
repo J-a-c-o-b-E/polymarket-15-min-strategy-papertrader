@@ -20,8 +20,6 @@ try:
 except Exception:
     WS_AVAILABLE = False
 
-# optional google drive deps (only used if env vars are set)
-# pip install google-api-python-client google-auth google-auth-httplib2
 try:
     from google.oauth2.credentials import Credentials  # type: ignore
     from google.auth.transport.requests import Request  # type: ignore
@@ -63,12 +61,10 @@ def clamp(n: float, lo: float, hi: float) -> float:
 
 
 def normalize_json_env(s: str) -> str:
-    # railway typically provides valid json strings as env vars
     return s.strip()
 
 
 def parse_clob_token_ids(v) -> List[str]:
-    # gamma often returns clobTokenIds as a json-stringified list
     if v is None:
         return []
     if isinstance(v, list):
@@ -95,17 +91,16 @@ class StrategyConfig:
     discovery_refresh_sec: float = 10.0
     lookback_limit: int = 250
 
-    buy_chunk_usd: float = 10.0
-    max_side_spend_usd: float = 40.0
-    require_free_cash: float = 0.50
+    # changed defaults per your request
+    buy_chunk_usd: float = 1.0
+    max_side_spend_usd: float = 4.0
+    require_free_cash: float = 0.05
 
-    # threshold35 mode
     entry_ask_cents: float = 35.0
     dca_step_cents: float = 5.0
-    dca_levels: int = 3  # number of additional buys after the first entry
+    dca_levels: int = 3
     sum_cap_dollars: float = 0.99
 
-    # spread73_22 mode
     expensive_min: float = 0.73
     cheap_max: float = 0.22
     spread_sum_cap: float = 1.00
@@ -140,7 +135,7 @@ class Fill:
     slug: str
     symbol: str
     token_id: str
-    side: str  # BUY or SELL
+    side: str
     price: float
     shares: float
     usd: float
@@ -178,8 +173,8 @@ class Position:
 
 class OrderBook:
     def __init__(self):
-        self.bids: List[Tuple[float, float]] = []  # price, size
-        self.asks: List[Tuple[float, float]] = []  # price, size
+        self.bids: List[Tuple[float, float]] = []
+        self.asks: List[Tuple[float, float]] = []
         self.last_update_ts: float = 0.0
 
     def best_bid(self) -> Optional[float]:
@@ -228,7 +223,6 @@ class OrderBookStore:
 
 
 class MarketFeed:
-    # maintains books for two tokens, ws if possible, rest fallback, rest backstop to reduce staleness
     def __init__(self, token_ids: List[str], store: OrderBookStore, cfg: StrategyConfig):
         self.token_ids = token_ids[:]
         self.store = store
@@ -302,7 +296,6 @@ class MarketFeed:
         self._ws_thread = threading.Thread(target=ws_supervisor, daemon=True)
         self._ws_thread.start()
 
-        # rest backstop
         self._thread = threading.Thread(target=self._rest_poll_loop, daemon=True)
         self._thread.start()
 
@@ -386,11 +379,7 @@ class PaperAccount:
         self.positions: Dict[str, Position] = {}
 
     def to_dict(self):
-        return {
-            "symbol": self.symbol,
-            "cash": self.cash,
-            "positions": {k: asdict(v) for k, v in self.positions.items()},
-        }
+        return {"symbol": self.symbol, "cash": self.cash, "positions": {k: asdict(v) for k, v in self.positions.items()}}
 
     @staticmethod
     def from_dict(cfg: StrategyConfig, d: dict, default_symbol: str, default_balance: float) -> "PaperAccount":
@@ -516,23 +505,6 @@ def consume_asks_for_buy(ob: OrderBook, usd_to_spend: float) -> Tuple[float, flo
     return shares, avg, spent
 
 
-def consume_bids_for_sell(ob: OrderBook, shares_to_sell: float) -> Tuple[float, float]:
-    remaining = shares_to_sell
-    received = 0.0
-    sold = 0.0
-    for price, size in ob.bids:
-        if remaining <= 1e-9:
-            break
-        sell_here = min(size, remaining)
-        if sell_here <= 0:
-            continue
-        received += sell_here * price
-        sold += sell_here
-        remaining -= sell_here
-    avg = (received / sold) if sold > 0 else 0.0
-    return received, avg
-
-
 class UpDownStrategyEngine:
     def __init__(self, cfg: StrategyConfig, mode: str):
         self.cfg = cfg
@@ -557,7 +529,7 @@ class UpDownStrategyEngine:
             return
 
         if self.mode == "threshold35":
-            self._step_threshold35(mkt, up_ob, down_ob, up_ask, down_ask, up_bid, down_bid, acct, flog)
+            self._step_threshold35(mkt, up_ob, down_ob, up_ask, down_ask, acct, flog)
         elif self.mode == "spread73_22":
             self._step_spread73_22(mkt, up_ob, down_ob, up_ask, down_ask, acct, flog)
 
@@ -588,47 +560,44 @@ class UpDownStrategyEngine:
             usd=spent,
             note=note,
         ))
-        print(f"[BUY] {mkt.symbol} {mkt.slug} usd={spent:.2f} shares={shares:.4f} avg={avg:.4f} note={note}")
 
-    def _maybe_sell_all(self, mkt: ActiveMarket, token_id: str, ob: OrderBook, acct: PaperAccount, flog: FileLogger, note: str):
-        pos = acct.positions.get(token_id)
-        if not pos or pos.shares <= 0:
-            return
-        received, avg = consume_bids_for_sell(ob, pos.shares)
-        if received <= 0:
+    def _dca_if_trigger(self, mkt: ActiveMarket, side_label: str, token_id: str, ob: OrderBook, best_ask: float, acct: PaperAccount, flog: FileLogger):
+        pos = acct.positions.get(token_id, Position())
+        if pos.cost_usd >= self.cfg.max_side_spend_usd:
             return
 
-        shares_sold = pos.shares
-        acct.cash += received
-        acct.positions[token_id] = Position(0.0, 0.0)
+        threshold = self.next_dca_threshold.get(side_label, self.cfg.entry_ask_cents / 100.0)
+        if best_ask <= threshold:
+            if self.dca_buys_done[side_label] <= self.cfg.dca_levels:
+                self._maybe_buy(mkt, token_id, ob, acct, flog, usd=self.cfg.buy_chunk_usd, note=f"{side_label}_entry_or_dca")
+                self.dca_buys_done[side_label] += 1
+                self.next_dca_threshold[side_label] = clamp(threshold - (self.cfg.dca_step_cents / 100.0), 0.01, 0.99)
 
-        flog.log_fill(Fill(
-            ts=utcnow().isoformat(),
-            slug=mkt.slug,
-            symbol=mkt.symbol,
-            token_id=token_id,
-            side="SELL",
-            price=avg,
-            shares=shares_sold,
-            usd=received,
-            note=note,
-        ))
-        print(f"[SELL] {mkt.symbol} {mkt.slug} usd={received:.2f} shares={shares_sold:.4f} avg={avg:.4f} note={note}")
-
-    def _step_threshold35(
-        self,
-        mkt: ActiveMarket,
-        up_ob: OrderBook,
-        down_ob: OrderBook,
-        up_ask: float,
-        down_ask: float,
-        up_bid: float,
-        down_bid: float,
-        acct: PaperAccount,
-        flog: FileLogger,
-    ):
+    def _hedge_chunks(self, mkt: ActiveMarket, primary_token: str, hedge_token: str, primary_pos: Position, hedge_pos: Position,
+                      hedge_ob: OrderBook, hedge_ask: float, acct: PaperAccount, flog: FileLogger):
         entry = self.cfg.entry_ask_cents / 100.0
+        if hedge_ask > entry:
+            return
 
+        while hedge_pos.cost_usd + 1e-9 < primary_pos.cost_usd:
+            if hedge_pos.cost_usd >= self.cfg.max_side_spend_usd:
+                break
+
+            est_shares, est_avg, est_spent = consume_asks_for_buy(hedge_ob, self.cfg.buy_chunk_usd)
+            if est_shares <= 0 or est_spent <= 0:
+                break
+
+            combined = primary_pos.avg_price + est_avg
+            if combined >= self.cfg.sum_cap_dollars:
+                break
+
+            self._maybe_buy(mkt, hedge_token, hedge_ob, acct, flog, usd=self.cfg.buy_chunk_usd, note="hedge_chunk_sumcap_ok")
+            hedge_pos = acct.positions.get(hedge_token, Position())
+            primary_pos = acct.positions.get(primary_token, Position())
+
+    def _step_threshold35(self, mkt: ActiveMarket, up_ob: OrderBook, down_ob: OrderBook, up_ask: float, down_ask: float,
+                          acct: PaperAccount, flog: FileLogger):
+        entry = self.cfg.entry_ask_cents / 100.0
         up_pos = acct.positions.get(mkt.up_token, Position())
         down_pos = acct.positions.get(mkt.down_token, Position())
 
@@ -648,85 +617,18 @@ class UpDownStrategyEngine:
 
         if self.primary == "UP" and up_pos.cost_usd > 0:
             self._hedge_chunks(mkt, primary_token=mkt.up_token, hedge_token=mkt.down_token,
-                               primary_pos=up_pos, hedge_pos=down_pos,
-                               hedge_ob=down_ob, hedge_ask=down_ask, acct=acct, flog=flog)
-
+                               primary_pos=up_pos, hedge_pos=down_pos, hedge_ob=down_ob, hedge_ask=down_ask, acct=acct, flog=flog)
         if self.primary == "DOWN" and down_pos.cost_usd > 0:
             self._hedge_chunks(mkt, primary_token=mkt.down_token, hedge_token=mkt.up_token,
-                               primary_pos=down_pos, hedge_pos=up_pos,
-                               hedge_ob=up_ob, hedge_ask=up_ask, acct=acct, flog=flog)
-
-        if self.cfg.allow_unhedged_breakeven_exit:
-            up_pos = acct.positions.get(mkt.up_token, Position())
-            down_pos = acct.positions.get(mkt.down_token, Position())
-            has_up = up_pos.shares > 0
-            has_down = down_pos.shares > 0
-
-            if has_up and not has_down and up_pos.avg_price > 0 and up_bid >= up_pos.avg_price:
-                self._maybe_sell_all(mkt, mkt.up_token, up_ob, acct, flog, note="unhedged_breakeven_exit")
-                self.primary = None
-
-            if has_down and not has_up and down_pos.avg_price > 0 and down_bid >= down_pos.avg_price:
-                self._maybe_sell_all(mkt, mkt.down_token, down_ob, acct, flog, note="unhedged_breakeven_exit")
-                self.primary = None
-
-    def _dca_if_trigger(self, mkt: ActiveMarket, side_label: str, token_id: str, ob: OrderBook, best_ask: float,
-                        acct: PaperAccount, flog: FileLogger):
-        pos = acct.positions.get(token_id, Position())
-        if pos.cost_usd >= self.cfg.max_side_spend_usd:
-            return
-
-        threshold = self.next_dca_threshold.get(side_label, self.cfg.entry_ask_cents / 100.0)
-        if best_ask <= threshold:
-            if self.dca_buys_done[side_label] <= self.cfg.dca_levels:
-                self._maybe_buy(mkt, token_id, ob, acct, flog, usd=self.cfg.buy_chunk_usd, note=f"{side_label}_entry_or_dca")
-                self.dca_buys_done[side_label] += 1
-                self.next_dca_threshold[side_label] = clamp(threshold - (self.cfg.dca_step_cents / 100.0), 0.01, 0.99)
-
-    def _hedge_chunks(
-        self,
-        mkt: ActiveMarket,
-        primary_token: str,
-        hedge_token: str,
-        primary_pos: Position,
-        hedge_pos: Position,
-        hedge_ob: OrderBook,
-        hedge_ask: float,
-        acct: PaperAccount,
-        flog: FileLogger,
-    ):
-        entry = self.cfg.entry_ask_cents / 100.0
-        if hedge_ask > entry:
-            return
-
-        while hedge_pos.cost_usd + 1e-9 < primary_pos.cost_usd:
-            if hedge_pos.cost_usd >= self.cfg.max_side_spend_usd:
-                break
-
-            est_shares, est_avg, est_spent = consume_asks_for_buy(hedge_ob, self.cfg.buy_chunk_usd)
-            if est_shares <= 0 or est_spent <= 0:
-                break
-
-            combined = primary_pos.avg_price + est_avg
-            if combined >= self.cfg.sum_cap_dollars:
-                break
-
-            self._maybe_buy(mkt, hedge_token, hedge_ob, acct, flog, usd=self.cfg.buy_chunk_usd, note="hedge_chunk_sumcap_ok")
-
-            hedge_pos = acct.positions.get(hedge_token, Position())
-            primary_pos = acct.positions.get(primary_token, Position())
+                               primary_pos=down_pos, hedge_pos=up_pos, hedge_ob=up_ob, hedge_ask=up_ask, acct=acct, flog=flog)
 
     def _step_spread73_22(self, mkt: ActiveMarket, up_ob: OrderBook, down_ob: OrderBook, up_ask: float, down_ask: float,
                           acct: PaperAccount, flog: FileLogger):
-        exp_min = self.cfg.expensive_min
-        cheap_max = self.cfg.cheap_max
-        sumcap = self.cfg.spread_sum_cap
-
-        if up_ask >= exp_min and down_ask <= cheap_max and (up_ask + down_ask) < sumcap:
+        if up_ask >= self.cfg.expensive_min and down_ask <= self.cfg.cheap_max and (up_ask + down_ask) < self.cfg.spread_sum_cap:
             self._maybe_buy(mkt, mkt.up_token, up_ob, acct, flog, usd=self.cfg.buy_chunk_usd, note="spread73_22_up_exp")
             self._maybe_buy(mkt, mkt.down_token, down_ob, acct, flog, usd=self.cfg.buy_chunk_usd, note="spread73_22_down_cheap")
 
-        if down_ask >= exp_min and up_ask <= cheap_max and (down_ask + up_ask) < sumcap:
+        if down_ask >= self.cfg.expensive_min and up_ask <= self.cfg.cheap_max and (down_ask + up_ask) < self.cfg.spread_sum_cap:
             self._maybe_buy(mkt, mkt.down_token, down_ob, acct, flog, usd=self.cfg.buy_chunk_usd, note="spread73_22_down_exp")
             self._maybe_buy(mkt, mkt.up_token, up_ob, acct, flog, usd=self.cfg.buy_chunk_usd, note="spread73_22_up_cheap")
 
@@ -752,18 +654,14 @@ def force_pick_winner(mkt: ActiveMarket, store: OrderBookStore) -> str:
         return "UP"
     if down_bid > up_bid:
         return "DOWN"
-    up_ask = up_ob.best_ask() or 1.0
-    down_ask = down_ob.best_ask() or 1.0
-    return "UP" if up_ask <= down_ask else "DOWN"
+    return "UP"
 
 
 class GoogleDriveUploader:
-    # overwrites files in a drive folder by filename, creates them if missing
     def __init__(self, drive_folder_id: str, oauth_client_json: str, oauth_token_json: str):
         if not GDRIVE_LIBS_AVAILABLE:
-            raise RuntimeError("missing google drive libs, install google-api-python-client google-auth google-auth-httplib2")
+            raise RuntimeError("missing google drive libs")
         self.drive_folder_id = drive_folder_id.strip()
-        self.oauth_client = json.loads(normalize_json_env(oauth_client_json))
         self.token_data = json.loads(normalize_json_env(oauth_token_json))
         self.service = self._build_service()
 
@@ -787,31 +685,21 @@ class GoogleDriveUploader:
         filename = drive_filename or os.path.basename(local_path)
         file_id = self._find_file_id(filename)
         media = MediaFileUpload(local_path, resumable=False)
-
         if file_id:
             self.service.files().update(fileId=file_id, media_body=media).execute()
             return file_id
-
         meta = {"name": filename, "parents": [self.drive_folder_id]}
         created = self.service.files().create(body=meta, media_body=media, fields="id").execute()
         return created["id"]
 
 
-def settle_market(
-    mkt: ActiveMarket,
-    store: OrderBookStore,
-    acct: PaperAccount,
-    flog: FileLogger,
-    cfg: StrategyConfig,
-    uploader: Optional[GoogleDriveUploader],
-) -> MarketResult:
+def settle_market(mkt: ActiveMarket, store: OrderBookStore, acct: PaperAccount, flog: FileLogger,
+                  cfg: StrategyConfig, uploader: Optional[GoogleDriveUploader]) -> MarketResult:
     up_pos = acct.positions.get(mkt.up_token, Position())
     down_pos = acct.positions.get(mkt.down_token, Position())
 
-    up_shares = up_pos.shares
-    down_shares = down_pos.shares
-    up_cost = up_pos.cost_usd
-    down_cost = down_pos.cost_usd
+    up_shares, down_shares = up_pos.shares, down_pos.shares
+    up_cost, down_cost = up_pos.cost_usd, down_pos.cost_usd
 
     start_wait = time.time()
     winner = None
@@ -820,7 +708,6 @@ def settle_market(
         if winner:
             break
         time.sleep(0.5)
-
     if not winner:
         winner = force_pick_winner(mkt, store)
 
@@ -849,25 +736,19 @@ def settle_market(
     )
     flog.log_result(res)
 
-    # uploads after every market settlement, so drive stays current market-by-market
     if uploader is not None:
         try:
             uploader.upload_or_update(cfg.results_csv)
             uploader.upload_or_update(cfg.trades_csv)
             uploader.upload_or_update(cfg.state_path)
-            print("[GDRIVE] uploaded results/trades/state")
-        except Exception as e:
-            print(f"[GDRIVE] upload failed: {e}")
+        except Exception:
+            pass
 
-    print(f"[SETTLE] {mkt.symbol} {mkt.slug} winner={winner} pnl={pnl:.2f} balance={acct.cash:.2f}")
     return res
 
 
 def load_state(cfg: StrategyConfig, start_balances: Dict[str, float]) -> Tuple[Dict[str, PaperAccount], dict]:
-    accounts: Dict[str, PaperAccount] = {
-        sym: PaperAccount(cfg, sym, start_balances.get(sym, 250.0))
-        for sym in cfg.symbols
-    }
+    accounts: Dict[str, PaperAccount] = {sym: PaperAccount(cfg, sym, start_balances.get(sym, 100.0)) for sym in cfg.symbols}
     meta: dict = {}
 
     if not os.path.exists(cfg.state_path):
@@ -876,14 +757,12 @@ def load_state(cfg: StrategyConfig, start_balances: Dict[str, float]) -> Tuple[D
     try:
         with open(cfg.state_path, "r", encoding="utf-8") as f:
             d = json.load(f)
-
         meta = d.get("meta", {}) or {}
         acc_blob = d.get("accounts")
-
         if isinstance(acc_blob, dict):
             for sym in cfg.symbols:
                 if sym in acc_blob:
-                    accounts[sym] = PaperAccount.from_dict(cfg, acc_blob[sym], sym, start_balances.get(sym, 250.0))
+                    accounts[sym] = PaperAccount.from_dict(cfg, acc_blob[sym], sym, start_balances.get(sym, 100.0))
         return accounts, meta
     except Exception:
         return accounts, meta
@@ -891,11 +770,7 @@ def load_state(cfg: StrategyConfig, start_balances: Dict[str, float]) -> Tuple[D
 
 def save_state(cfg: StrategyConfig, accounts: Dict[str, PaperAccount], meta: dict):
     try:
-        d = {
-            "accounts": {sym: acct.to_dict() for sym, acct in accounts.items()},
-            "meta": meta,
-            "saved_at": utcnow().isoformat(),
-        }
+        d = {"accounts": {sym: acct.to_dict() for sym, acct in accounts.items()}, "meta": meta, "saved_at": utcnow().isoformat()}
         with open(cfg.state_path, "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2)
     except Exception:
@@ -904,19 +779,12 @@ def save_state(cfg: StrategyConfig, accounts: Dict[str, PaperAccount], meta: dic
 
 def init_gdrive_uploader_from_env() -> Optional[GoogleDriveUploader]:
     drive_folder_id = os.getenv("DRIVE_FOLDER_ID", "").strip()
-    oauth_client_json = os.getenv("GOOGLE_OAUTH_CLIENT_JSON", "").strip()
     oauth_token_json = os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
-
-    if not (drive_folder_id and oauth_client_json and oauth_token_json):
-        print("[GDRIVE] disabled (missing env vars)")
+    if not (drive_folder_id and oauth_token_json):
         return None
-
     try:
-        uploader = GoogleDriveUploader(drive_folder_id, oauth_client_json, oauth_token_json)
-        print("[GDRIVE] enabled")
-        return uploader
-    except Exception as e:
-        print(f"[GDRIVE] disabled (init failed): {e}")
+        return GoogleDriveUploader(drive_folder_id, "", oauth_token_json)
+    except Exception:
         return None
 
 
@@ -924,41 +792,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["threshold35", "spread73_22"], default="threshold35")
     ap.add_argument("--symbol", choices=["BTC", "ETH", "SOL", "XRP", "AUTO"], default="AUTO")
-    ap.add_argument("--slug", default="", help="optional: trade a specific market slug (overrides discovery)")
-
-    ap.add_argument("--start-btc", type=float, default=250.0)
-    ap.add_argument("--start-eth", type=float, default=250.0)
-    ap.add_argument("--start-sol", type=float, default=250.0)
-    ap.add_argument("--start-xrp", type=float, default=250.0)
-
-    ap.add_argument("--buy-chunk", type=float, default=10.0)
-    ap.add_argument("--max-side-spend", type=float, default=40.0)
-    ap.add_argument("--entry-cents", type=float, default=35.0)
-    ap.add_argument("--dca-step-cents", type=float, default=5.0)
-    ap.add_argument("--dca-levels", type=int, default=3)
-    ap.add_argument("--sumcap", type=float, default=0.99)
-
     ap.add_argument("--prefer-rest", action="store_true")
-    ap.add_argument("--unhedged-breakeven-exit", action="store_true")
     args = ap.parse_args()
 
     cfg = StrategyConfig()
-    cfg.buy_chunk_usd = float(args.buy_chunk)
-    cfg.max_side_spend_usd = float(args.max_side_spend)
-    cfg.entry_ask_cents = float(args.entry_cents)
-    cfg.dca_step_cents = float(args.dca_step_cents)
-    cfg.dca_levels = int(args.dca_levels)
-    cfg.sum_cap_dollars = float(args.sumcap)
-    cfg.allow_unhedged_breakeven_exit = bool(args.unhedged_breakeven_exit)
     if args.prefer_rest:
         cfg.prefer_websocket = False
 
-    start_balances = {
-        "BTC": float(args.start_btc),
-        "ETH": float(args.start_eth),
-        "SOL": float(args.start_sol),
-        "XRP": float(args.start_xrp),
-    }
+    # requested defaults: starting balance 100 each, buy size $1
+    start_balances = {"BTC": 100.0, "ETH": 100.0, "SOL": 100.0, "XRP": 100.0}
 
     flog = FileLogger(cfg.trades_csv, cfg.results_csv)
     accounts, meta = load_state(cfg, start_balances)
@@ -970,78 +812,26 @@ def main():
     active_market: Optional[ActiveMarket] = None
     feed: Optional[MarketFeed] = None
 
-    # resume if state contains an active market
-    if meta.get("active_market"):
-        try:
-            am = meta["active_market"]
-            active_market = ActiveMarket(
-                symbol=str(am["symbol"]),
-                slug=str(am["slug"]),
-                condition_id=str(am["condition_id"]),
-                end_time=parse_iso_dt(am["end_time"]) or utcnow(),
-                up_token=str(am["up_token"]),
-                down_token=str(am["down_token"]),
-            )
-        except Exception:
-            active_market = None
-
-    if active_market:
-        engine.reset_for_new_market()
-        feed = MarketFeed([active_market.up_token, active_market.down_token], store, cfg)
-        feed.start()
-        print(f"[RESUME] {active_market.symbol} {active_market.slug} balance={accounts[active_market.symbol].cash:.2f}")
-    else:
-        print(f"[START] mode={args.mode} ws_available={WS_AVAILABLE}")
-        for sym in cfg.symbols:
-            print(f"[ACCOUNT] {sym} balance={accounts[sym].cash:.2f}")
-
     last_discovery = 0.0
     last_state_save = 0.0
+
+    print(f"[START] mode={args.mode} ws_available={WS_AVAILABLE} chunk_usd={cfg.buy_chunk_usd} start_balance=100")
 
     while True:
         now = utcnow()
 
-        # market selection
-        if args.slug.strip():
-            if not active_market or active_market.slug != args.slug.strip():
-                slug = args.slug.strip()
-                md = gamma_get_market_by_slug(slug)
-                if not md:
-                    print(f"[DISCOVERY] cannot fetch slug={slug}, retrying")
-                    time.sleep(2)
-                    continue
-
-                condition_id = str(md.get("conditionId") or md.get("condition_id") or "")
-                end_time = parse_iso_dt(md.get("endDateIso") or md.get("endDate") or md.get("end_date_iso"))
-                clob_ids = parse_clob_token_ids(md.get("clobTokenIds"))
-
-                if not end_time or len(clob_ids) < 2 or not condition_id:
-                    print(f"[DISCOVERY] missing end_time/tokens/condition for slug={slug}, retrying")
-                    time.sleep(2)
-                    continue
-
-                sym = "BTC"
-                for s in cfg.symbols:
-                    if slug.startswith(cfg.slug_prefix_map.get(s, "")):
-                        sym = s
-                        break
-
-                active_market = ActiveMarket(
-                    symbol=sym,
-                    slug=slug,
-                    condition_id=condition_id,
-                    end_time=end_time,
-                    up_token=str(clob_ids[0]),
-                    down_token=str(clob_ids[1]),
-                )
-
+        if active_market is None or (time.time() - last_discovery) >= cfg.discovery_refresh_sec:
+            last_discovery = time.time()
+            only_symbol = None if args.symbol == "AUTO" else args.symbol
+            nxt = discover_next_market(cfg, only_symbol=only_symbol)
+            if nxt and (active_market is None or nxt.slug != active_market.slug):
+                active_market = nxt
                 engine.reset_for_new_market()
                 if feed is None:
                     feed = MarketFeed([active_market.up_token, active_market.down_token], store, cfg)
                     feed.start()
                 else:
                     feed.set_token_ids([active_market.up_token, active_market.down_token])
-
                 meta["active_market"] = {
                     "symbol": active_market.symbol,
                     "slug": active_market.slug,
@@ -1051,63 +841,29 @@ def main():
                     "down_token": active_market.down_token,
                 }
 
-                print(f"[MARKET] {active_market.symbol} trading {active_market.slug} ends={active_market.end_time.isoformat()} balance={accounts[active_market.symbol].cash:.2f}")
-
-        else:
-            if active_market is None or (time.time() - last_discovery) >= cfg.discovery_refresh_sec:
-                last_discovery = time.time()
-                only_symbol = None if args.symbol == "AUTO" else args.symbol
-                nxt = discover_next_market(cfg, only_symbol=only_symbol)
-
-                if nxt and (active_market is None or nxt.slug != active_market.slug):
-                    active_market = nxt
-                    engine.reset_for_new_market()
-
-                    if feed is None:
-                        feed = MarketFeed([active_market.up_token, active_market.down_token], store, cfg)
-                        feed.start()
-                    else:
-                        feed.set_token_ids([active_market.up_token, active_market.down_token])
-
-                    meta["active_market"] = {
-                        "symbol": active_market.symbol,
-                        "slug": active_market.slug,
-                        "condition_id": active_market.condition_id,
-                        "end_time": active_market.end_time.isoformat(),
-                        "up_token": active_market.up_token,
-                        "down_token": active_market.down_token,
-                    }
-
-                    print(f"[MARKET] {active_market.symbol} trading {active_market.slug} ends={active_market.end_time.isoformat()} balance={accounts[active_market.symbol].cash:.2f}")
-
         if active_market is None or feed is None:
             time.sleep(1)
             continue
 
         acct = accounts[active_market.symbol]
 
-        # strategy loop
         try:
             engine.step(active_market, store, acct, flog)
         except KeyboardInterrupt:
             raise
-        except Exception as e:
-            print(f"[STEP] error: {e}")
+        except Exception:
+            pass
 
-        # settle after end
         if now >= (active_market.end_time + timedelta(seconds=float(cfg.settle_grace_sec))):
             try:
                 settle_market(active_market, store, acct, flog, cfg, uploader)
-            except Exception as e:
-                print(f"[SETTLE] error {e}, retrying")
-                time.sleep(2)
+            except Exception:
+                time.sleep(1)
                 continue
-
             meta["last_settled"] = active_market.slug
             meta["active_market"] = None
             active_market = None
 
-        # persistence
         if (time.time() - last_state_save) >= 3.0:
             last_state_save = time.time()
             save_state(cfg, accounts, meta)
@@ -1119,5 +875,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[STOP] ctrl+c received, state saved")
         sys.exit(0)
