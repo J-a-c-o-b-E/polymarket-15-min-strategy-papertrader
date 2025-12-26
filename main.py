@@ -20,6 +20,8 @@ try:
 except Exception:
     WS_AVAILABLE = False
 
+# optional google drive deps (only used if env vars are set)
+# pip install google-api-python-client google-auth google-auth-httplib2
 try:
     from google.oauth2.credentials import Credentials  # type: ignore
     from google.auth.transport.requests import Request  # type: ignore
@@ -91,7 +93,7 @@ class StrategyConfig:
     discovery_refresh_sec: float = 10.0
     lookback_limit: int = 250
 
-    # changed defaults per your request
+    # requested defaults
     buy_chunk_usd: float = 1.0
     max_side_spend_usd: float = 4.0
     require_free_cash: float = 0.05
@@ -658,7 +660,7 @@ def force_pick_winner(mkt: ActiveMarket, store: OrderBookStore) -> str:
 
 
 class GoogleDriveUploader:
-    def __init__(self, drive_folder_id: str, oauth_client_json: str, oauth_token_json: str):
+    def __init__(self, drive_folder_id: str, oauth_token_json: str):
         if not GDRIVE_LIBS_AVAILABLE:
             raise RuntimeError("missing google drive libs")
         self.drive_folder_id = drive_folder_id.strip()
@@ -781,10 +783,14 @@ def init_gdrive_uploader_from_env() -> Optional[GoogleDriveUploader]:
     drive_folder_id = os.getenv("DRIVE_FOLDER_ID", "").strip()
     oauth_token_json = os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
     if not (drive_folder_id and oauth_token_json):
+        print("[GDRIVE] disabled (missing env vars)")
         return None
     try:
-        return GoogleDriveUploader(drive_folder_id, "", oauth_token_json)
-    except Exception:
+        u = GoogleDriveUploader(drive_folder_id, oauth_token_json)
+        print("[GDRIVE] enabled")
+        return u
+    except Exception as e:
+        print(f"[GDRIVE] disabled (init failed): {e}")
         return None
 
 
@@ -799,12 +805,25 @@ def main():
     if args.prefer_rest:
         cfg.prefer_websocket = False
 
-    # requested defaults: starting balance 100 each, buy size $1
+    # hard set start balances to 100 on all symbols
     start_balances = {"BTC": 100.0, "ETH": 100.0, "SOL": 100.0, "XRP": 100.0}
 
     flog = FileLogger(cfg.trades_csv, cfg.results_csv)
     accounts, meta = load_state(cfg, start_balances)
     uploader = init_gdrive_uploader_from_env()
+
+    # create/upload the csvs immediately on startup (and state file too)
+    if uploader is not None:
+        try:
+            uploader.upload_or_update(cfg.trades_csv)
+            uploader.upload_or_update(cfg.results_csv)
+            if not os.path.exists(cfg.state_path):
+                with open(cfg.state_path, "w", encoding="utf-8") as f:
+                    json.dump({"accounts": {}, "meta": {}, "saved_at": utcnow().isoformat()}, f)
+            uploader.upload_or_update(cfg.state_path)
+            print("[GDRIVE] initial upload done")
+        except Exception as e:
+            print(f"[GDRIVE] initial upload failed: {e}")
 
     store = OrderBookStore()
     engine = UpDownStrategyEngine(cfg, mode=args.mode)
@@ -815,7 +834,7 @@ def main():
     last_discovery = 0.0
     last_state_save = 0.0
 
-    print(f"[START] mode={args.mode} ws_available={WS_AVAILABLE} chunk_usd={cfg.buy_chunk_usd} start_balance=100")
+    print(f"[START] mode={args.mode} chunk_usd={cfg.buy_chunk_usd} start_balance=100 ws_available={WS_AVAILABLE}")
 
     while True:
         now = utcnow()
